@@ -28,7 +28,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # cerrar en prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,7 +48,7 @@ def instagram_url(username: str) -> str:
 
 def take_screenshot(url: str) -> str:
     response = requests.post(
-        "https://chrome.browserless.io/screenshot",
+        "https://production-sfo.browserless.io/screenshot",
         params={"token": BROWSERLESS_API_KEY},
         json={
             "url": url,
@@ -73,11 +73,10 @@ def take_screenshot(url: str) -> str:
 
     image_base64 = base64.b64encode(response.content).decode("utf-8")
 
-    # Imagen demasiado pequeña = login wall / bloqueo
     if len(image_base64) < 20_000:
         raise HTTPException(
             status_code=400,
-            detail="Instagram profile not accessible"
+            detail="Profile not accessible"
         )
 
     return image_base64
