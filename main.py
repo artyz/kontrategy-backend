@@ -52,28 +52,25 @@ def take_screenshot(url: str) -> str:
         "url": url,
         "render_js": "true",
         "premium_proxy": "true",
-        "screenshot": "true",
-        "screenshot_format": "png",
+        "full_page": "false",
         "user_agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
             "AppleWebKit/605.1.15 (KHTML, like Gecko) "
             "Version/16.0 Mobile/15E148 Safari/604.1"
-        )
+        ),
     }
 
     res = requests.get(
-        "https://app.scrapingbee.com/api/v1/",
+        "https://app.scrapingbee.com/api/v1/screenshot",
         params=params,
         timeout=120
     )
 
-    content_type = res.headers.get("Content-Type", "")
-
-    if res.status_code != 200 or "image" not in content_type:
+    if res.status_code != 200:
         print("SCRAPINGBEE ERROR:", res.text[:500])
         raise HTTPException(
             status_code=500,
-            detail="ScrapingBee did not return an image"
+            detail="ScrapingBee screenshot failed"
         )
 
     return base64.b64encode(res.content).decode("utf-8")
@@ -84,7 +81,7 @@ Analiza VISUALMENTE este perfil de Instagram.
 Evalúa colores predominantes, consistencia gráfica,
 tipografías, estructura del feed y presencia humana.
 
-Devuelve un JSON con este formato exacto:
+Devuelve EXCLUSIVAMENTE un JSON válido con este formato:
 
 {
   "scores": {
@@ -131,18 +128,16 @@ def root():
 def visual_analysis(data: VisualAnalysisRequest):
     username = data.username.replace("@", "").strip().lower()
 
-    url = instagram_url(username)
+    image_base64 = take_screenshot(instagram_url(username))
 
-    image_base64 = take_screenshot(url)
+    result = analyze_with_gpt(image_base64)
 
-    parsed = analyze_with_gpt(image_base64)
-
-    scores = parsed["scores"]
+    scores = result["scores"]
     total_score = sum(scores.values())
 
     return {
         "username": username,
         "scores": scores,
         "total_score": total_score,
-        "interpretation": parsed["interpretation"]
+        "interpretation": result["interpretation"]
     }
