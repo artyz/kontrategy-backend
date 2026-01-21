@@ -11,13 +11,13 @@ from openai import OpenAI
 # ENV
 # =====================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-BROWSERLESS_API_KEY = os.getenv("BROWSERLESS_API_KEY")
+SCRAPINGBEE_API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
 
-if not BROWSERLESS_API_KEY:
-    raise RuntimeError("BROWSERLESS_API_KEY missing")
+if not SCRAPINGBEE_API_KEY:
+    raise RuntimeError("SCRAPINGBEE_API_KEY missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -47,44 +47,46 @@ def instagram_url(username: str) -> str:
     return f"https://www.instagram.com/{username}/"
 
 def take_screenshot(url: str) -> str:
-    response = requests.post(
-        "https://production-sfo.browserless.io/screenshot",
-        params={"token": BROWSERLESS_API_KEY},
-        json={
-            "url": url,
-            "waitUntil": "domcontentloaded",
-            "viewport": {"width": 1280, "height": 2000},
-            "userAgent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "options": {
-                "fullPage": False,
-                "type": "png"
-            }
-        },
-        timeout=60
+    params = {
+        "api_key": SCRAPINGBEE_API_KEY,
+        "url": url,
+        "render_js": "true",
+        "premium_proxy": "true",
+        "screenshot": "true",
+        "screenshot_full_page": "false",
+        "block_ads": "true",
+        "block_resources": "false",
+    }
+
+    res = requests.get(
+        "https://app.scrapingbee.com/api/v1/",
+        params=params,
+        timeout=120
     )
 
-    if response.status_code != 200:
-        print("BROWSERLESS ERROR:", response.text)
-        raise HTTPException(status_code=500, detail="Screenshot failed")
+    if res.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail=f"ScrapingBee failed ({res.status_code})"
+        )
 
-    image_base64 = base64.b64encode(response.content).decode("utf-8")
+    image_base64 = base64.b64encode(res.content).decode("utf-8")
 
     if len(image_base64) < 20_000:
         raise HTTPException(
             status_code=400,
-            detail="Profile not accessible"
+            detail="Screenshot invalid or blocked"
         )
 
     return image_base64
 
 def analyze_with_gpt(image_base64: str):
     prompt = """
-Devuelve EXCLUSIVAMENTE un JSON válido (sin texto adicional, sin markdown)
-con este formato exacto:
+Analiza VISUALMENTE este perfil de Instagram.
+Evalúa colores, consistencia gráfica, tipografías, estructura del feed
+y presencia humana.
+
+Devuelve EXCLUSIVAMENTE un JSON válido con este formato:
 
 {
   "scores": {
@@ -94,7 +96,7 @@ con este formato exacto:
     "calidad_visual": 1,
     "presencia_humana": 1
   },
-  "interpretation": "texto breve profesional"
+  "interpretation": "análisis visual profesional breve"
 }
 """
 
@@ -139,7 +141,6 @@ def visual_analysis(data: VisualAnalysisRequest):
     try:
         parsed = json.loads(gpt_result)
     except json.JSONDecodeError:
-        print("GPT RAW RESPONSE:", gpt_result)
         raise HTTPException(status_code=500, detail="GPT returned invalid JSON")
 
     scores = parsed["scores"]
