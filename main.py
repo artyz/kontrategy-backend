@@ -1,7 +1,17 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI()
+
+# ✅ CORS (ESTO ES LO QUE ARREGLA TODO)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # luego lo cerramos a tu dominio
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class VisualAnalysisRequest(BaseModel):
     username: str
@@ -13,7 +23,6 @@ def root():
 
 @app.post("/analysis/visual")
 def visual_analysis(data: VisualAnalysisRequest):
-    # SIMULACIÓN (luego conectamos ChatGPT real)
     scores = {
         "paleta_colores": 4,
         "ruido_visual": 4,
