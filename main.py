@@ -1,9 +1,10 @@
 import os
+import json
 import base64
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, constr
 from openai import OpenAI
 
 # =====================
@@ -12,8 +13,11 @@ from openai import OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BROWSERLESS_API_KEY = os.getenv("BROWSERLESS_API_KEY")
 
-if not OPENAI_API_KEY or not BROWSERLESS_API_KEY:
-    raise RuntimeError("Missing API keys")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY missing")
+
+if not BROWSERLESS_API_KEY:
+    raise RuntimeError("BROWSERLESS_API_KEY missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -24,7 +28,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # luego cerramos
+    allow_origins=["*"],  # cerrar en prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,7 +38,7 @@ app.add_middleware(
 # MODELS
 # =====================
 class VisualAnalysisRequest(BaseModel):
-    username: str
+    username: constr(min_length=1, max_length=30)
 
 # =====================
 # HELPERS
@@ -61,19 +65,28 @@ def take_screenshot(url: str) -> str:
     if response.status_code != 200:
         raise HTTPException(status_code=500, detail="Screenshot failed")
 
-    return base64.b64encode(response.content).decode("utf-8")
+    image_base64 = base64.b64encode(response.content).decode("utf-8")
+
+    if len(image_base64) < 20_000:
+        raise HTTPException(
+            status_code=400,
+            detail="Instagram profile not accessible"
+        )
+
+    return image_base64
 
 def analyze_with_gpt(image_base64: str):
     prompt = """
-Analiza visualmente este perfil de Instagram y devuelve SOLO un JSON con este formato exacto:
+Devuelve EXCLUSIVAMENTE un JSON válido (sin texto adicional, sin markdown)
+con este formato exacto:
 
 {
   "scores": {
-    "paleta_colores": 1-5,
-    "ruido_visual": 1-5,
-    "consistencia_grafica": 1-5,
-    "calidad_visual": 1-5,
-    "presencia_humana": 1-5
+    "paleta_colores": 1,
+    "ruido_visual": 1,
+    "consistencia_grafica": 1,
+    "calidad_visual": 1,
+    "presencia_humana": 1
   },
   "interpretation": "texto breve profesional"
 }
@@ -117,9 +130,10 @@ def visual_analysis(data: VisualAnalysisRequest):
     gpt_result = analyze_with_gpt(image_base64)
 
     try:
-        parsed = eval(gpt_result)  # controlado porque forzamos formato
-    except Exception:
-        raise HTTPException(status_code=500, detail="GPT parsing error")
+        parsed = json.loads(gpt_result)
+    except json.JSONDecodeError:
+        print("GPT RAW RESPONSE:", gpt_result)
+        raise HTTPException(status_code=500, detail="GPT returned invalid JSON")
 
     scores = parsed["scores"]
     total_score = sum(scores.values())
