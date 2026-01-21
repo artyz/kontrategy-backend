@@ -28,7 +28,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # cerrar en prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -76,23 +76,15 @@ def take_screenshot(url: str) -> str:
             detail="ScrapingBee did not return an image"
         )
 
-    image_base64 = base64.b64encode(res.content).decode("utf-8")
+    return base64.b64encode(res.content).decode("utf-8")
 
-    if len(image_base64) < 20_000:
-        raise HTTPException(
-            status_code=400,
-            detail="Screenshot invalid or blocked"
-        )
-
-    return image_base64
-
-def analyze_with_gpt(image_base64: str):
+def analyze_with_gpt(image_base64: str) -> dict:
     prompt = """
 Analiza VISUALMENTE este perfil de Instagram.
 Evalúa colores predominantes, consistencia gráfica,
 tipografías, estructura del feed y presencia humana.
 
-Devuelve EXCLUSIVAMENTE un JSON válido con este formato:
+Devuelve un JSON con este formato exacto:
 
 {
   "scores": {
@@ -108,6 +100,7 @@ Devuelve EXCLUSIVAMENTE un JSON válido con este formato:
 
     response = client.chat.completions.create(
         model="gpt-4o",
+        response_format={"type": "json_object"},
         messages=[
             {
                 "role": "user",
@@ -142,13 +135,7 @@ def visual_analysis(data: VisualAnalysisRequest):
 
     image_base64 = take_screenshot(url)
 
-    gpt_result = analyze_with_gpt(image_base64)
-
-    try:
-        parsed = json.loads(gpt_result)
-    except json.JSONDecodeError:
-        print("GPT RAW RESPONSE:", gpt_result)
-        raise HTTPException(status_code=500, detail="GPT returned invalid JSON")
+    parsed = analyze_with_gpt(image_base64)
 
     scores = parsed["scores"]
     total_score = sum(scores.values())
