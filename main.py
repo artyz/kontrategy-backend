@@ -1,5 +1,4 @@
 import os
-import base64
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,7 +36,7 @@ app.add_middleware(
 # MODELS
 # =====================
 class VisualAnalysisRequest(BaseModel):
-    username: constr(min_length=1, max_length=50)
+    username: constr(min_length=1, max_length=100)
 
 # =====================
 # HELPERS
@@ -51,9 +50,8 @@ def take_screenshot(url: str) -> str:
         "url": url,
         "render_js": "true",
         "premium_proxy": "true",
-        "screenshot": "true",              # 🔴 OBLIGATORIO
-        "screenshot_format": "png",        # 🔴 OBLIGATORIO
-        "screenshot_full_page": "false",
+        "screenshot": "true",
+        "screenshot_format": "png",
         "country_code": "us",
         "user_agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
@@ -74,15 +72,23 @@ def take_screenshot(url: str) -> str:
             detail="ScrapingBee screenshot failed"
         )
 
-    return base64.b64encode(response.content).decode("utf-8")
+    data = response.json()
+
+    if "screenshot" not in data:
+        raise HTTPException(
+            status_code=500,
+            detail="ScrapingBee response missing screenshot"
+        )
+
+    return data["screenshot"]  # 🔴 YA ES BASE64
 
 def analyze_with_gpt(image_base64: str) -> dict:
     prompt = """
-Analiza VISUALMENTE este perfil de Instagram.
-Evalúa paleta de colores, ruido visual, consistencia gráfica,
-calidad visual general y presencia humana.
+Analiza VISUALMENTE esta página.
+Evalúa paleta de colores, estructura, tipografías,
+consistencia gráfica y jerarquía visual.
 
-Devuelve EXCLUSIVAMENTE un JSON válido con este formato:
+Devuelve SOLO un JSON válido con este formato:
 
 {
   "scores": {
@@ -129,9 +135,15 @@ def root():
 def visual_analysis(data: VisualAnalysisRequest):
     username = data.username.replace("@", "").replace("/", "").strip().lower()
 
-    screenshot = take_screenshot(instagram_url(username))
+    url = (
+        data.username
+        if data.username.startswith("http")
+        else instagram_url(username)
+    )
 
-    analysis = analyze_with_gpt(screenshot)
+    screenshot_base64 = take_screenshot(url)
+
+    analysis = analyze_with_gpt(screenshot_base64)
 
     scores = analysis["scores"]
     total_score = sum(scores.values())
