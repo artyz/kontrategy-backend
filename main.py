@@ -1,5 +1,4 @@
 import os
-import json
 import base64
 import requests
 from fastapi import FastAPI, HTTPException
@@ -38,7 +37,7 @@ app.add_middleware(
 # MODELS
 # =====================
 class VisualAnalysisRequest(BaseModel):
-    username: constr(min_length=1, max_length=30)
+    username: constr(min_length=1, max_length=50)
 
 # =====================
 # HELPERS
@@ -52,34 +51,36 @@ def take_screenshot(url: str) -> str:
         "url": url,
         "render_js": "true",
         "premium_proxy": "true",
-        "full_page": "false",
+        "screenshot": "true",              # 🔴 OBLIGATORIO
+        "screenshot_format": "png",        # 🔴 OBLIGATORIO
+        "screenshot_full_page": "false",
+        "country_code": "us",
         "user_agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
             "AppleWebKit/605.1.15 (KHTML, like Gecko) "
             "Version/16.0 Mobile/15E148 Safari/604.1"
-        ),
+        )
     }
 
-    res = requests.get(
+    response = requests.get(
         "https://app.scrapingbee.com/api/v1/screenshot",
         params=params,
         timeout=120
     )
 
-    if res.status_code != 200:
-        print("SCRAPINGBEE ERROR:", res.text[:500])
+    if response.status_code != 200:
         raise HTTPException(
             status_code=500,
             detail="ScrapingBee screenshot failed"
         )
 
-    return base64.b64encode(res.content).decode("utf-8")
+    return base64.b64encode(response.content).decode("utf-8")
 
 def analyze_with_gpt(image_base64: str) -> dict:
     prompt = """
 Analiza VISUALMENTE este perfil de Instagram.
-Evalúa colores predominantes, consistencia gráfica,
-tipografías, estructura del feed y presencia humana.
+Evalúa paleta de colores, ruido visual, consistencia gráfica,
+calidad visual general y presencia humana.
 
 Devuelve EXCLUSIVAMENTE un JSON válido con este formato:
 
@@ -126,18 +127,18 @@ def root():
 
 @app.post("/analysis/visual")
 def visual_analysis(data: VisualAnalysisRequest):
-    username = data.username.replace("@", "").strip().lower()
+    username = data.username.replace("@", "").replace("/", "").strip().lower()
 
-    image_base64 = take_screenshot(instagram_url(username))
+    screenshot = take_screenshot(instagram_url(username))
 
-    result = analyze_with_gpt(image_base64)
+    analysis = analyze_with_gpt(screenshot)
 
-    scores = result["scores"]
+    scores = analysis["scores"]
     total_score = sum(scores.values())
 
     return {
         "username": username,
         "scores": scores,
         "total_score": total_score,
-        "interpretation": result["interpretation"]
+        "interpretation": analysis["interpretation"]
     }
