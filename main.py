@@ -28,7 +28,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # cerrar en prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,9 +53,7 @@ def take_screenshot(url: str) -> str:
         "render_js": "true",
         "premium_proxy": "true",
         "screenshot": "true",
-        "screenshot_full_page": "false",
-        "block_ads": "true",
-        "block_resources": "false",
+        "screenshot_format": "png",
     }
 
     res = requests.get(
@@ -64,10 +62,13 @@ def take_screenshot(url: str) -> str:
         timeout=120
     )
 
-    if res.status_code != 200:
+    content_type = res.headers.get("Content-Type", "")
+
+    if res.status_code != 200 or "image" not in content_type:
+        print("SCRAPINGBEE ERROR:", res.text[:500])
         raise HTTPException(
             status_code=500,
-            detail=f"ScrapingBee failed ({res.status_code})"
+            detail="ScrapingBee did not return an image"
         )
 
     image_base64 = base64.b64encode(res.content).decode("utf-8")
@@ -83,8 +84,8 @@ def take_screenshot(url: str) -> str:
 def analyze_with_gpt(image_base64: str):
     prompt = """
 Analiza VISUALMENTE este perfil de Instagram.
-Evalúa colores, consistencia gráfica, tipografías, estructura del feed
-y presencia humana.
+Evalúa colores, consistencia gráfica, tipografías,
+estructura del feed y presencia humana.
 
 Devuelve EXCLUSIVAMENTE un JSON válido con este formato:
 
@@ -141,6 +142,7 @@ def visual_analysis(data: VisualAnalysisRequest):
     try:
         parsed = json.loads(gpt_result)
     except json.JSONDecodeError:
+        print("GPT RAW RESPONSE:", gpt_result)
         raise HTTPException(status_code=500, detail="GPT returned invalid JSON")
 
     scores = parsed["scores"]
