@@ -4,25 +4,38 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# ✅ CORS (ESTO ES LO QUE ARREGLA TODO)
+# =========================
+# CORS
+# =========================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # luego lo cerramos a tu dominio
+    allow_origins=["*"],  # luego lo cerramos
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =========================
+# MODELS
+# =========================
 class VisualAnalysisRequest(BaseModel):
     username: str
-    image_url: str
+    image_url: str | None = None
 
+# =========================
+# ROUTES
+# =========================
 @app.get("/")
 def root():
     return {"status": "Kontrategy backend alive"}
 
 @app.post("/analysis/visual")
 def visual_analysis(data: VisualAnalysisRequest):
+    """
+    🔹 MOCK por ahora
+    🔹 Luego aquí entra ChatGPT Vision
+    """
+
     scores = {
         "paleta_colores": 4,
         "ruido_visual": 4,
