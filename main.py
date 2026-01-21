@@ -52,8 +52,13 @@ def take_screenshot(url: str) -> str:
         params={"token": BROWSERLESS_API_KEY},
         json={
             "url": url,
-            "waitUntil": "networkidle2",
+            "waitUntil": "domcontentloaded",
             "viewport": {"width": 1280, "height": 2000},
+            "userAgent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
             "options": {
                 "fullPage": False,
                 "type": "png"
@@ -63,10 +68,12 @@ def take_screenshot(url: str) -> str:
     )
 
     if response.status_code != 200:
+        print("BROWSERLESS ERROR:", response.text)
         raise HTTPException(status_code=500, detail="Screenshot failed")
 
     image_base64 = base64.b64encode(response.content).decode("utf-8")
 
+    # Imagen demasiado pequeña = login wall / bloqueo
     if len(image_base64) < 20_000:
         raise HTTPException(
             status_code=400,
@@ -125,6 +132,7 @@ def visual_analysis(data: VisualAnalysisRequest):
     username = data.username.replace("@", "").strip().lower()
 
     url = instagram_url(username)
+
     image_base64 = take_screenshot(url)
 
     gpt_result = analyze_with_gpt(image_base64)
