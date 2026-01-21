@@ -54,6 +54,11 @@ def take_screenshot(url: str) -> str:
         "premium_proxy": "true",
         "screenshot": "true",
         "screenshot_format": "png",
+        "user_agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/16.0 Mobile/15E148 Safari/604.1"
+        )
     }
 
     res = requests.get(
@@ -84,8 +89,8 @@ def take_screenshot(url: str) -> str:
 def analyze_with_gpt(image_base64: str):
     prompt = """
 Analiza VISUALMENTE este perfil de Instagram.
-Evalúa colores, consistencia gráfica, tipografías,
-estructura del feed y presencia humana.
+Evalúa colores predominantes, consistencia gráfica,
+tipografías, estructura del feed y presencia humana.
 
 Devuelve EXCLUSIVAMENTE un JSON válido con este formato:
 
