@@ -1,4 +1,5 @@
 import os
+import base64
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,7 +37,7 @@ app.add_middleware(
 # MODELS
 # =====================
 class VisualAnalysisRequest(BaseModel):
-    username: constr(min_length=1, max_length=100)
+    username: constr(min_length=1, max_length=200)
 
 # =====================
 # HELPERS
@@ -45,6 +46,10 @@ def instagram_url(username: str) -> str:
     return f"https://www.instagram.com/{username}/"
 
 def take_screenshot(url: str) -> str:
+    """
+    Usa ScrapingBee en modo BINARIO.
+    Devuelve la imagen en base64.
+    """
     params = {
         "api_key": SCRAPINGBEE_API_KEY,
         "url": url,
@@ -61,7 +66,7 @@ def take_screenshot(url: str) -> str:
     }
 
     response = requests.get(
-        "https://app.scrapingbee.com/api/v1/screenshot",
+        "https://app.scrapingbee.com/api/v1/",
         params=params,
         timeout=120
     )
@@ -69,26 +74,33 @@ def take_screenshot(url: str) -> str:
     if response.status_code != 200:
         raise HTTPException(
             status_code=500,
-            detail="ScrapingBee screenshot failed"
+            detail=f"ScrapingBee failed ({response.status_code})"
         )
 
-    data = response.json()
-
-    if "screenshot" not in data:
+    if not response.content or len(response.content) < 1000:
         raise HTTPException(
             status_code=500,
-            detail="ScrapingBee response missing screenshot"
+            detail="ScrapingBee did not return a valid image"
         )
 
-    return data["screenshot"]  # 🔴 YA ES BASE64
+    return base64.b64encode(response.content).decode("utf-8")
 
 def analyze_with_gpt(image_base64: str) -> dict:
+    """
+    Análisis visual puro: colores, estructura, tipografías, jerarquía.
+    Fuerza salida JSON válida.
+    """
     prompt = """
-Analiza VISUALMENTE esta página.
-Evalúa paleta de colores, estructura, tipografías,
-consistencia gráfica y jerarquía visual.
+Analiza VISUALMENTE esta página web.
 
-Devuelve SOLO un JSON válido con este formato:
+Evalúa:
+- Paleta de colores
+- Ruido visual
+- Consistencia gráfica
+- Calidad visual
+- Presencia humana (caras/personas visibles)
+
+Devuelve SOLO un JSON válido con este formato exacto:
 
 {
   "scores": {
@@ -98,7 +110,7 @@ Devuelve SOLO un JSON válido con este formato:
     "calidad_visual": 1,
     "presencia_humana": 1
   },
-  "interpretation": "análisis visual profesional breve"
+  "interpretation": "Análisis visual profesional breve"
 }
 """
 
@@ -133,13 +145,14 @@ def root():
 
 @app.post("/analysis/visual")
 def visual_analysis(data: VisualAnalysisRequest):
-    username = data.username.replace("@", "").replace("/", "").strip().lower()
+    raw_value = data.username.strip()
 
-    url = (
-        data.username
-        if data.username.startswith("http")
-        else instagram_url(username)
-    )
+    if raw_value.startswith("http"):
+        url = raw_value
+        username = raw_value
+    else:
+        username = raw_value.replace("@", "").replace("/", "").lower()
+        url = instagram_url(username)
 
     screenshot_base64 = take_screenshot(url)
 
