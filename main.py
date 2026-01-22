@@ -1,11 +1,10 @@
 import os
-import json
 import time
+import json
 import requests
-from typing import List
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, constr
 from openai import OpenAI
 
 # =====================
@@ -13,20 +12,15 @@ from openai import OpenAI
 # =====================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+APIFY_TASK_ID = os.getenv("APIFY_TASK_ID")  # ej: j9cZg41h6HafO2n1R
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
 
-if not APIFY_TOKEN:
-    raise RuntimeError("APIFY_TOKEN missing")
+if not APIFY_TOKEN or not APIFY_TASK_ID:
+    raise RuntimeError("APIFY_TOKEN or APIFY_TASK_ID missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# =====================
-# APIFY CONFIG
-# =====================
-APIFY_TASK_ID = "j9cZg41h6HafO2n1R"
-APIFY_BASE_URL = "https://api.apify.com/v2"
 
 # =====================
 # APP
@@ -45,40 +39,47 @@ app.add_middleware(
 # MODELS
 # =====================
 class VisualAnalysisRequest(BaseModel):
-    username: str
+    username: constr(min_length=1, max_length=200)
 
 # =====================
-# APIFY HELPERS
+# APIFY
 # =====================
-def run_apify_task(instagram_url: str) -> str:
-    url = f"{APIFY_BASE_URL}/actor-tasks/{APIFY_TASK_ID}/run-sync-get-dataset-items"
-    params = {
-        "token": APIFY_TOKEN,
-        "clean": "true"
-    }
+def run_apify_task(instagram_url: str) -> list[dict]:
+    run_url = (
+        f"https://api.apify.com/v2/actor-tasks/"
+        f"{APIFY_TASK_ID}/run-sync-get-dataset-items"
+    )
 
     payload = {
-        "directUrls": [instagram_url],
-        "resultsLimit": 30
+        "instagramUrls": [instagram_url],
+        "resultsLimit": 12
     }
 
-    res = requests.post(url, params=params, json=payload, timeout=120)
-    res.raise_for_status()
+    res = requests.post(
+        f"{run_url}?token={APIFY_TOKEN}",
+        json=payload,
+        timeout=180
+    )
+
+    if res.status_code != 200:
+        raise RuntimeError("Apify task failed")
+
     return res.json()
 
 # =====================
 # GPT ANALYSIS
 # =====================
-def analyze_with_gpt(images: List[str], captions: List[str]) -> dict:
+def analyze_with_gpt(images: list[str], captions: list[str]) -> dict:
     prompt = f"""
-Analiza el LOOK & FEEL visual de este perfil de Instagram.
+Analiza el LOOK & FEEL de un perfil de Instagram.
 
-Evalúa del 1 al 5:
-- paleta_colores
-- consistencia_grafica
-- ruido_visual
-- calidad_visual
-- presencia_humana
+Evalúa:
+- Paleta de colores
+- Consistencia visual
+- Ruido visual
+- Calidad gráfica
+- Presencia humana
+- Tipo de contenido dominante
 
 Devuelve SOLO JSON válido con este formato:
 
@@ -90,7 +91,8 @@ Devuelve SOLO JSON válido con este formato:
     "calidad_visual": 1,
     "presencia_humana": 1
   }},
-  "interpretation": "Análisis visual profesional"
+  "dominant_content_type": "educativo | entretenimiento | promocional | mixto",
+  "interpretation": "Análisis visual profesional breve"
 }}
 
 Contexto textual:
@@ -110,7 +112,7 @@ Contexto textual:
                             "type": "image_url",
                             "image_url": {"url": img}
                         }
-                        for img in images[:8]
+                        for img in images[:6]
                     ]
                 )
             }
@@ -129,64 +131,69 @@ def root():
 
 @app.post("/analysis/visual")
 def visual_analysis(data: VisualAnalysisRequest):
-    username = data.username.replace("@", "").strip().lower()
-    instagram_url = f"https://www.instagram.com/{username}/"
+    raw = data.username.strip()
+
+    if raw.startswith("http"):
+        username = raw.rstrip("/").split("/")[-1]
+        instagram_url = raw
+    else:
+        username = raw.replace("@", "").lower()
+        instagram_url = f"https://www.instagram.com/{username}/"
 
     # =====================
-    # APIFY SCRAPE
+    # APIFY DATA
     # =====================
-    dataset = run_apify_task(instagram_url)
+    items = run_apify_task(instagram_url)
 
-    if not dataset or len(dataset) == 0:
-        return {"status": "error", "message": "No data from Apify"}
+    if not items:
+        raise HTTPException(status_code=404, detail="No data from Apify")
 
-    profile = dataset[0]
+    profile = items[0]
 
     # =====================
-    # PROFILE DATA
+    # PROFILE INFO
     # =====================
-    profile_data = {
+    profile_info = {
         "username": username,
-        "full_name": profile.get("fullName"),
-        "biography": profile.get("biography"),
+        "icon": profile.get("profilePicUrl"),
         "category": profile.get("businessCategoryName"),
-        "profile_pic": profile.get("profilePicUrl"),
+        "description": profile.get("biography"),
         "followers": profile.get("followersCount"),
         "following": profile.get("followsCount"),
         "posts": profile.get("postsCount"),
     }
 
     # =====================
-    # POSTS / IMAGES
+    # IMAGES + CAPTIONS
     # =====================
     images = []
     captions = []
 
-    for post in profile.get("latestPosts", []):
-        if post.get("displayUrl"):
-            images.append(post["displayUrl"])
-        if post.get("caption"):
-            captions.append(post["caption"])
+    for item in items:
+        img = item.get("displayUrl")
+        if img:
+            images.append(img)
+
+        caption = item.get("caption")
+        if caption:
+            captions.append(caption)
 
     if len(images) < 3:
-        return {
-            "status": "error",
-            "message": "Not enough images for visual analysis",
-            **profile_data
-        }
+        raise HTTPException(status_code=400, detail="Not enough images")
 
     # =====================
-    # GPT VISION
+    # GPT ANALYSIS
     # =====================
     analysis = analyze_with_gpt(images, captions)
+
     scores = analysis["scores"]
     total_score = sum(scores.values())
 
     return {
         "status": "ok",
-        **profile_data,
+        "profile": profile_info,
         "scores": scores,
-        "total_score": total_score,
-        "score_over_10": round((total_score / 25) * 10, 1),
+        "total_score": round(total_score / 5 * 10, 1),
+        "dominant_content_type": analysis["dominant_content_type"],
         "interpretation": analysis["interpretation"]
     }
