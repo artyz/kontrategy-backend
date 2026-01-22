@@ -34,23 +34,31 @@ app.add_middleware(
 # =====================
 class VisualAnalysisRequest(BaseModel):
     username: constr(min_length=1, max_length=200)
-    mode: str = "summary"  # summary | detail
+    mode: str = "summary"
     images: Optional[List[str]] = None
     captions: Optional[List[str]] = None
 
 # =====================
+# HELPERS
+# =====================
+def filter_valid_images(images: List[str]) -> List[str]:
+    valid = []
+    for img in images:
+        img_lower = img.lower()
+        if any(ext in img_lower for ext in [".jpg", ".jpeg", ".png", ".webp"]) \
+           and not any(bad in img_lower for bad in ["googlelogo", "gstatic", "logo", "sprite", ".gif", ".svg"]):
+            valid.append(img)
+    return valid[:10]  # límite seguro para GPT
+
+# =====================
 # GPT ANALYSIS
 # =====================
-def analyze_with_gpt(images: list[str], captions: list[str]) -> dict:
-    """
-    Análisis visual + semántico basado en thumbnails + contexto textual.
-    """
-
+def analyze_with_gpt(images: List[str], captions: List[str]) -> dict:
     prompt = f"""
 Analiza el LOOK & FEEL de un perfil de Instagram basándote en:
 
-1. Thumbnails de los últimos posts
-2. Contexto textual (títulos y descripciones)
+1. Thumbnails de posts reales
+2. Contexto textual
 
 Evalúa:
 - Paleta de colores
@@ -58,9 +66,9 @@ Evalúa:
 - Ruido visual
 - Calidad gráfica
 - Presencia humana
-- Tipo de contenido dominante (educativo, entretenimiento, promocional)
+- Tipo de contenido dominante
 
-Devuelve SOLO JSON válido con este formato EXACTO:
+Devuelve SOLO JSON válido:
 
 {{
   "scores": {{
@@ -71,11 +79,8 @@ Devuelve SOLO JSON válido con este formato EXACTO:
     "presencia_humana": 1
   }},
   "dominant_content_type": "educativo | entretenimiento | promocional | mixto",
-  "interpretation": "Análisis visual profesional breve"
+  "interpretation": "Análisis profesional breve"
 }}
-
-Contexto textual:
-{json.dumps(captions, ensure_ascii=False)}
 """
 
     response = client.chat.completions.create(
@@ -86,13 +91,7 @@ Contexto textual:
                 "role": "user",
                 "content": (
                     [{"type": "text", "text": prompt}]
-                    + [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": img}
-                        }
-                        for img in images
-                    ]
+                    + [{"type": "image_url", "image_url": {"url": img}} for img in images]
                 )
             }
         ],
@@ -110,18 +109,9 @@ def root():
 
 @app.post("/analysis/visual")
 def visual_analysis(data: VisualAnalysisRequest):
-    raw = data.username.strip()
-    mode = data.mode
+    username = data.username.strip().replace("@", "").replace("/", "").lower()
 
-    if raw.startswith("http"):
-        username = raw.rstrip("/").split("/")[-1]
-    else:
-        username = raw.replace("@", "").replace("/", "").lower()
-
-    # =====================
-    # SUMMARY MODE (dashboard)
-    # =====================
-    if mode == "summary":
+    if data.mode == "summary":
         return {
             "status": "ok",
             "username": username,
@@ -135,22 +125,23 @@ def visual_analysis(data: VisualAnalysisRequest):
             "total_score": 18
         }
 
-    # =====================
-    # DETAIL MODE (assets desde frontend)
-    # =====================
-    if not data.images or len(data.images) < 3:
+    if not data.images:
         return {
             "status": "no_assets",
-            "username": username,
-            "message": "No se recibieron suficientes imágenes desde el frontend",
-            "scores": None,
-            "total_score": None,
-            "interpretation": None
+            "message": "No se recibieron imágenes desde el frontend"
+        }
+
+    images = filter_valid_images(data.images)
+
+    if len(images) < 3:
+        return {
+            "status": "no_assets",
+            "message": "Imágenes insuficientes o inválidas para análisis"
         }
 
     captions = data.captions or []
 
-    analysis = analyze_with_gpt(data.images, captions)
+    analysis = analyze_with_gpt(images, captions)
 
     scores = analysis["scores"]
     total_score = sum(scores.values())
