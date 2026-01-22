@@ -1,6 +1,4 @@
 import os
-import base64
-import requests
 import json
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +9,6 @@ from openai import OpenAI
 # ENV
 # =====================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SCRAPINGBEE_API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
@@ -38,101 +35,78 @@ class VisualAnalysisRequest(BaseModel):
     username: constr(min_length=1, max_length=200)
 
 # =====================
-# HELPERS
+# MOCK DATA (temporal)
+# luego será reemplazado por Google results reales
 # =====================
-def instagram_url(username: str) -> str:
-    return f"https://www.instagram.com/{username}/"
-
-def take_screenshot(url: str) -> str | None:
+def get_mock_assets(username: str):
     """
-    Intenta obtener screenshot.
-    Si falla, devuelve None (NO rompe el flujo).
+    Simula los últimos 15 posts del perfil
+    usando thumbnails + captions públicas.
     """
-    if not SCRAPINGBEE_API_KEY:
-        return None
+    images = [
+        f"https://example.com/{username}/thumb_{i}.jpg"
+        for i in range(1, 16)
+    ]
 
-    params = {
-        "api_key": SCRAPINGBEE_API_KEY,
-        "url": url,
-        "render_js": "true",
-        "screenshot": "true",
-        "screenshot_format": "png",
-        "premium_proxy": "true",
-        "user_agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-            "Version/16.0 Mobile/15E148 Safari/604.1"
-        )
-    }
+    captions = [
+        "Post educativo con texto sobre imagen",
+        "Video con presentador hablando a cámara",
+        "Gráfico con branding fuerte",
+        "Contenido promocional",
+        "Post inspiracional minimalista",
+    ] * 3
 
-    try:
-        response = requests.get(
-            "https://app.scrapingbee.com/api/v1/",
-            params=params,
-            timeout=90
-        )
+    return images[:15], captions[:15]
 
-        if response.status_code != 200:
-            return None
-
-        if not response.content or len(response.content) < 1500:
-            return None
-
-        return base64.b64encode(response.content).decode("utf-8")
-
-    except Exception:
-        return None
-
-def analyze_with_gpt(image_base64: str) -> dict:
+# =====================
+# GPT ANALYSIS
+# =====================
+def analyze_with_gpt(images: list[str], captions: list[str]) -> dict:
     """
-    Análisis visual puro.
-    GARANTIZA JSON válido.
+    Análisis visual SEMÁNTICO.
+    NO necesita screenshot real.
     """
-    prompt = """
-Analiza VISUALMENTE esta imagen.
+    prompt = f"""
+Eres un estratega visual senior especializado en Instagram.
 
-Evalúa:
-- Paleta de colores
-- Ruido visual
+Tienes un GRID SIMULADO 3x5 (15 posts).
+
+IMÁGENES (thumbnails públicas):
+{json.dumps(images, indent=2)}
+
+TEXTOS / DESCRIPCIONES:
+{json.dumps(captions, indent=2)}
+
+Analiza el LOOK & FEEL del perfil considerando:
+- Paleta de colores dominante
 - Consistencia gráfica
+- Ruido visual
 - Calidad visual
-- Presencia humana (caras/personas)
+- Presencia humana
+- Uso de texto sobre imagen
+- Repetición de formatos
 
 Devuelve SOLO JSON válido con este formato EXACTO:
 
-{
-  "scores": {
+{{
+  "scores": {{
     "paleta_colores": 1,
     "ruido_visual": 1,
     "consistencia_grafica": 1,
     "calidad_visual": 1,
     "presencia_humana": 1
-  },
-  "interpretation": "Texto breve profesional"
-}
+  }},
+  "interpretation": "Análisis visual profesional breve"
+}}
 """
 
     response = client.chat.completions.create(
         model="gpt-4o",
         response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{image_base64}"
-                        }
-                    }
-                ]
-            }
-        ],
-        max_tokens=300
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=400
     )
 
-    # 🔒 GPT devuelve string JSON → lo parseamos
     return json.loads(response.choices[0].message.content)
 
 # =====================
@@ -146,27 +120,18 @@ def root():
 def visual_analysis(data: VisualAnalysisRequest):
     raw = data.username.strip()
 
-    if raw.startswith("http"):
-        url = raw
-        username = raw
-    else:
-        username = raw.replace("@", "").replace("/", "").lower()
-        url = instagram_url(username)
+    username = (
+        raw.replace("https://www.instagram.com/", "")
+        .replace("@", "")
+        .replace("/", "")
+        .lower()
+    )
 
-    screenshot_base64 = take_screenshot(url)
+    # 🔹 Paso 1: obtener assets (mock por ahora)
+    images, captions = get_mock_assets(username)
 
-    # 🚨 SI NO HAY IMAGEN → NO ROMPE
-    if not screenshot_base64:
-        return {
-            "status": "no_image",
-            "username": username,
-            "message": "No se pudo generar screenshot visual",
-            "scores": None,
-            "total_score": None,
-            "interpretation": None
-        }
-
-    analysis = analyze_with_gpt(screenshot_base64)
+    # 🔹 Paso 2: análisis visual semántico
+    analysis = analyze_with_gpt(images, captions)
 
     scores = analysis["scores"]
     total_score = sum(scores.values())
@@ -176,5 +141,5 @@ def visual_analysis(data: VisualAnalysisRequest):
         "username": username,
         "scores": scores,
         "total_score": total_score,
-        "interpretation": analysis["interpretation"]
+        "interpretation": analysis["interpretation"],
     }
