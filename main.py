@@ -1,18 +1,25 @@
 import os
 import json
+import requests
+from typing import List, Optional
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, constr
-from typing import List, Optional
 from openai import OpenAI
 
 # =====================
 # ENV
 # =====================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+APIFY_TASK_ID = os.getenv("APIFY_TASK_ID")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
+
+if not APIFY_TOKEN or not APIFY_TASK_ID:
+    raise RuntimeError("APIFY_TOKEN or APIFY_TASK_ID missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -34,31 +41,48 @@ app.add_middleware(
 # =====================
 class VisualAnalysisRequest(BaseModel):
     username: constr(min_length=1, max_length=200)
-    mode: str = "summary"
-    images: Optional[List[str]] = None
-    captions: Optional[List[str]] = None
+    mode: str = "detail"  # summary | detail
 
 # =====================
-# HELPERS
+# APIFY
 # =====================
-def filter_valid_images(images: List[str]) -> List[str]:
-    valid = []
-    for img in images:
-        img_lower = img.lower()
-        if any(ext in img_lower for ext in [".jpg", ".jpeg", ".png", ".webp"]) \
-           and not any(bad in img_lower for bad in ["googlelogo", "gstatic", "logo", "sprite", ".gif", ".svg"]):
-            valid.append(img)
-    return valid[:10]  # límite seguro para GPT
+def fetch_instagram_assets(username: str, limit: int = 12):
+    """
+    Obtiene imágenes y captions reales desde Instagram vía Apify
+    """
+    url = (
+        f"https://api.apify.com/v2/actor-tasks/"
+        f"{APIFY_TASK_ID}/run-sync-get-dataset-items"
+        f"?token={APIFY_TOKEN}"
+    )
+
+    payload = {
+        "directUrls": [f"https://www.instagram.com/{username}/"],
+        "resultsLimit": limit,
+        "resultsType": "posts"
+    }
+
+    res = requests.post(url, json=payload, timeout=90)
+    res.raise_for_status()
+
+    data = res.json()
+
+    images = []
+    captions = []
+
+    for item in data:
+        if item.get("displayUrl"):
+            images.append(item["displayUrl"])
+            captions.append(item.get("caption", ""))
+
+    return images, captions
 
 # =====================
 # GPT ANALYSIS
 # =====================
 def analyze_with_gpt(images: List[str], captions: List[str]) -> dict:
     prompt = f"""
-Analiza el LOOK & FEEL de un perfil de Instagram basándote en:
-
-1. Thumbnails de posts reales
-2. Contexto textual
+Analiza VISUALMENTE este perfil de Instagram basándote SOLO en las imágenes.
 
 Evalúa:
 - Paleta de colores
@@ -66,9 +90,11 @@ Evalúa:
 - Ruido visual
 - Calidad gráfica
 - Presencia humana
-- Tipo de contenido dominante
 
-Devuelve SOLO JSON válido:
+Determina además:
+- Tipo de contenido dominante (educativo, entretenimiento, promocional, mixto)
+
+Devuelve SOLO JSON válido con este formato EXACTO:
 
 {{
   "scores": {{
@@ -79,8 +105,11 @@ Devuelve SOLO JSON válido:
     "presencia_humana": 1
   }},
   "dominant_content_type": "educativo | entretenimiento | promocional | mixto",
-  "interpretation": "Análisis profesional breve"
+  "interpretation": "Análisis visual profesional breve"
 }}
+
+Contexto textual (captions):
+{json.dumps(captions, ensure_ascii=False)}
 """
 
     response = client.chat.completions.create(
@@ -91,7 +120,13 @@ Devuelve SOLO JSON válido:
                 "role": "user",
                 "content": (
                     [{"type": "text", "text": prompt}]
-                    + [{"type": "image_url", "image_url": {"url": img}} for img in images]
+                    + [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": img}
+                        }
+                        for img in images
+                    ]
                 )
             }
         ],
@@ -109,8 +144,16 @@ def root():
 
 @app.post("/analysis/visual")
 def visual_analysis(data: VisualAnalysisRequest):
-    username = data.username.strip().replace("@", "").replace("/", "").lower()
+    raw = data.username.strip()
 
+    if raw.startswith("http"):
+        username = raw.rstrip("/").split("/")[-1]
+    else:
+        username = raw.replace("@", "").replace("/", "").lower()
+
+    # =====================
+    # SUMMARY MODE
+    # =====================
     if data.mode == "summary":
         return {
             "status": "ok",
@@ -125,21 +168,28 @@ def visual_analysis(data: VisualAnalysisRequest):
             "total_score": 18
         }
 
-    if not data.images:
+    # =====================
+    # DETAIL MODE (APIFY)
+    # =====================
+    try:
+        images, captions = fetch_instagram_assets(username)
+    except Exception as e:
         return {
-            "status": "no_assets",
-            "message": "No se recibieron imágenes desde el frontend"
+            "status": "error",
+            "username": username,
+            "message": "Error obteniendo datos desde Instagram",
+            "detail": str(e)
         }
 
-    images = filter_valid_images(data.images)
-
-    if len(images) < 3:
+    if not images or len(images) < 3:
         return {
             "status": "no_assets",
-            "message": "Imágenes insuficientes o inválidas para análisis"
+            "username": username,
+            "message": "No se pudieron obtener suficientes imágenes",
+            "scores": None,
+            "total_score": None,
+            "interpretation": None
         }
-
-    captions = data.captions or []
 
     analysis = analyze_with_gpt(images, captions)
 
