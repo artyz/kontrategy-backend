@@ -3,15 +3,8 @@ import json
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, constr
+from typing import List, Optional
 from openai import OpenAI
-
-# =====================
-# GOOGLE ASSETS
-# =====================
-from services.google_assets import (
-    google_image_thumbnails,
-    google_search_snippets
-)
 
 # =====================
 # ENV
@@ -42,6 +35,8 @@ app.add_middleware(
 class VisualAnalysisRequest(BaseModel):
     username: constr(min_length=1, max_length=200)
     mode: str = "summary"  # summary | detail
+    images: Optional[List[str]] = None
+    captions: Optional[List[str]] = None
 
 # =====================
 # GPT ANALYSIS
@@ -49,7 +44,6 @@ class VisualAnalysisRequest(BaseModel):
 def analyze_with_gpt(images: list[str], captions: list[str]) -> dict:
     """
     Análisis visual + semántico basado en thumbnails + contexto textual.
-    Garantiza JSON válido.
     """
 
     prompt = f"""
@@ -125,7 +119,7 @@ def visual_analysis(data: VisualAnalysisRequest):
         username = raw.replace("@", "").replace("/", "").lower()
 
     # =====================
-    # SUMMARY MODE (rápido – dashboard)
+    # SUMMARY MODE (dashboard)
     # =====================
     if mode == "summary":
         return {
@@ -142,27 +136,21 @@ def visual_analysis(data: VisualAnalysisRequest):
         }
 
     # =====================
-    # DETAIL MODE (Google assets + GPT)
+    # DETAIL MODE (assets desde frontend)
     # =====================
-    images = google_image_thumbnails(username, limit=15)
-    snippets = google_search_snippets(username, limit=10)
-
-    captions = [
-        f"{item['title']}. {item['snippet']}"
-        for item in snippets
-    ]
-
-    if not images:
+    if not data.images or len(data.images) < 3:
         return {
             "status": "no_assets",
             "username": username,
-            "message": "Google no devolvió thumbnails públicos",
+            "message": "No se recibieron suficientes imágenes desde el frontend",
             "scores": None,
             "total_score": None,
             "interpretation": None
         }
 
-    analysis = analyze_with_gpt(images, captions)
+    captions = data.captions or []
+
+    analysis = analyze_with_gpt(data.images, captions)
 
     scores = analysis["scores"]
     total_score = sum(scores.values())
