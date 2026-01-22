@@ -6,6 +6,14 @@ from pydantic import BaseModel, constr
 from openai import OpenAI
 
 # =====================
+# GOOGLE ASSETS
+# =====================
+from services.google_assets import (
+    google_image_thumbnails,
+    google_search_snippets
+)
+
+# =====================
 # ENV
 # =====================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -35,56 +43,27 @@ class VisualAnalysisRequest(BaseModel):
     username: constr(min_length=1, max_length=200)
 
 # =====================
-# MOCK DATA (temporal)
-# luego será reemplazado por Google results reales
-# =====================
-def get_mock_assets(username: str):
-    """
-    Simula los últimos 15 posts del perfil
-    usando thumbnails + captions públicas.
-    """
-    images = [
-        f"https://example.com/{username}/thumb_{i}.jpg"
-        for i in range(1, 16)
-    ]
-
-    captions = [
-        "Post educativo con texto sobre imagen",
-        "Video con presentador hablando a cámara",
-        "Gráfico con branding fuerte",
-        "Contenido promocional",
-        "Post inspiracional minimalista",
-    ] * 3
-
-    return images[:15], captions[:15]
-
-# =====================
 # GPT ANALYSIS
 # =====================
 def analyze_with_gpt(images: list[str], captions: list[str]) -> dict:
     """
-    Análisis visual SEMÁNTICO.
-    NO necesita screenshot real.
+    Análisis visual + semántico basado en thumbnails + contexto textual.
+    Garantiza JSON válido.
     """
+
     prompt = f"""
-Eres un estratega visual senior especializado en Instagram.
+Analiza el LOOK & FEEL de un perfil de Instagram basándote en:
 
-Tienes un GRID SIMULADO 3x5 (15 posts).
+1. Thumbnails de los últimos posts
+2. Contexto textual (títulos y descripciones)
 
-IMÁGENES (thumbnails públicas):
-{json.dumps(images, indent=2)}
-
-TEXTOS / DESCRIPCIONES:
-{json.dumps(captions, indent=2)}
-
-Analiza el LOOK & FEEL del perfil considerando:
-- Paleta de colores dominante
-- Consistencia gráfica
+Evalúa:
+- Paleta de colores
+- Consistencia visual
 - Ruido visual
-- Calidad visual
+- Calidad gráfica
 - Presencia humana
-- Uso de texto sobre imagen
-- Repetición de formatos
+- Tipo de contenido dominante (educativo, entretenimiento, promocional)
 
 Devuelve SOLO JSON válido con este formato EXACTO:
 
@@ -96,15 +75,33 @@ Devuelve SOLO JSON válido con este formato EXACTO:
     "calidad_visual": 1,
     "presencia_humana": 1
   }},
+  "dominant_content_type": "educativo | entretenimiento | promocional | mixto",
   "interpretation": "Análisis visual profesional breve"
 }}
+
+Contexto textual:
+{json.dumps(captions, ensure_ascii=False)}
 """
 
     response = client.chat.completions.create(
         model="gpt-4o",
         response_format={"type": "json_object"},
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=400
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    [{"type": "text", "text": prompt}]
+                    + [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": img}
+                        }
+                        for img in images
+                    ]
+                )
+            }
+        ],
+        max_tokens=500
     )
 
     return json.loads(response.choices[0].message.content)
@@ -120,17 +117,32 @@ def root():
 def visual_analysis(data: VisualAnalysisRequest):
     raw = data.username.strip()
 
-    username = (
-        raw.replace("https://www.instagram.com/", "")
-        .replace("@", "")
-        .replace("/", "")
-        .lower()
-    )
+    if raw.startswith("http"):
+        username = raw.rstrip("/").split("/")[-1]
+    else:
+        username = raw.replace("@", "").replace("/", "").lower()
 
-    # 🔹 Paso 1: obtener assets (mock por ahora)
-    images, captions = get_mock_assets(username)
+    # =====================
+    # GOOGLE ASSETS
+    # =====================
+    images = google_image_thumbnails(username, limit=15)
+    snippets = google_search_snippets(username, limit=10)
 
-    # 🔹 Paso 2: análisis visual semántico
+    captions = [
+        f"{item['title']}. {item['snippet']}"
+        for item in snippets
+    ]
+
+    if not images:
+        return {
+            "status": "no_assets",
+            "username": username,
+            "message": "Google no devolvió thumbnails públicos",
+            "scores": None,
+            "total_score": None,
+            "interpretation": None
+        }
+
     analysis = analyze_with_gpt(images, captions)
 
     scores = analysis["scores"]
@@ -141,5 +153,6 @@ def visual_analysis(data: VisualAnalysisRequest):
         "username": username,
         "scores": scores,
         "total_score": total_score,
-        "interpretation": analysis["interpretation"],
+        "dominant_content_type": analysis["dominant_content_type"],
+        "interpretation": analysis["interpretation"]
     }
