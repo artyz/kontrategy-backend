@@ -1,7 +1,8 @@
 import os
 import base64
 import requests
-from fastapi import FastAPI, HTTPException
+import json
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, constr
 from openai import OpenAI
@@ -14,9 +15,6 @@ SCRAPINGBEE_API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing")
-
-if not SCRAPINGBEE_API_KEY:
-    raise RuntimeError("SCRAPINGBEE_API_KEY missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -45,19 +43,21 @@ class VisualAnalysisRequest(BaseModel):
 def instagram_url(username: str) -> str:
     return f"https://www.instagram.com/{username}/"
 
-def take_screenshot(url: str) -> str:
+def take_screenshot(url: str) -> str | None:
     """
-    Usa ScrapingBee en modo BINARIO.
-    Devuelve la imagen en base64.
+    Intenta obtener screenshot.
+    Si falla, devuelve None (NO rompe el flujo).
     """
+    if not SCRAPINGBEE_API_KEY:
+        return None
+
     params = {
         "api_key": SCRAPINGBEE_API_KEY,
         "url": url,
         "render_js": "true",
-        "premium_proxy": "true",
         "screenshot": "true",
         "screenshot_format": "png",
-        "country_code": "us",
+        "premium_proxy": "true",
         "user_agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
             "AppleWebKit/605.1.15 (KHTML, like Gecko) "
@@ -65,42 +65,40 @@ def take_screenshot(url: str) -> str:
         )
     }
 
-    response = requests.get(
-        "https://app.scrapingbee.com/api/v1/",
-        params=params,
-        timeout=120
-    )
-
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=500,
-            detail=f"ScrapingBee failed ({response.status_code})"
+    try:
+        response = requests.get(
+            "https://app.scrapingbee.com/api/v1/",
+            params=params,
+            timeout=90
         )
 
-    if not response.content or len(response.content) < 1000:
-        raise HTTPException(
-            status_code=500,
-            detail="ScrapingBee did not return a valid image"
-        )
+        if response.status_code != 200:
+            return None
 
-    return base64.b64encode(response.content).decode("utf-8")
+        if not response.content or len(response.content) < 1500:
+            return None
+
+        return base64.b64encode(response.content).decode("utf-8")
+
+    except Exception:
+        return None
 
 def analyze_with_gpt(image_base64: str) -> dict:
     """
-    Análisis visual puro: colores, estructura, tipografías, jerarquía.
-    Fuerza salida JSON válida.
+    Análisis visual puro.
+    GARANTIZA JSON válido.
     """
     prompt = """
-Analiza VISUALMENTE esta página web.
+Analiza VISUALMENTE esta imagen.
 
 Evalúa:
 - Paleta de colores
 - Ruido visual
 - Consistencia gráfica
 - Calidad visual
-- Presencia humana (caras/personas visibles)
+- Presencia humana (caras/personas)
 
-Devuelve SOLO un JSON válido con este formato exacto:
+Devuelve SOLO JSON válido con este formato EXACTO:
 
 {
   "scores": {
@@ -110,7 +108,7 @@ Devuelve SOLO un JSON válido con este formato exacto:
     "calidad_visual": 1,
     "presencia_humana": 1
   },
-  "interpretation": "Análisis visual profesional breve"
+  "interpretation": "Texto breve profesional"
 }
 """
 
@@ -134,7 +132,8 @@ Devuelve SOLO un JSON válido con este formato exacto:
         max_tokens=300
     )
 
-    return response.choices[0].message.content
+    # 🔒 GPT devuelve string JSON → lo parseamos
+    return json.loads(response.choices[0].message.content)
 
 # =====================
 # ROUTES
@@ -145,16 +144,27 @@ def root():
 
 @app.post("/analysis/visual")
 def visual_analysis(data: VisualAnalysisRequest):
-    raw_value = data.username.strip()
+    raw = data.username.strip()
 
-    if raw_value.startswith("http"):
-        url = raw_value
-        username = raw_value
+    if raw.startswith("http"):
+        url = raw
+        username = raw
     else:
-        username = raw_value.replace("@", "").replace("/", "").lower()
+        username = raw.replace("@", "").replace("/", "").lower()
         url = instagram_url(username)
 
     screenshot_base64 = take_screenshot(url)
+
+    # 🚨 SI NO HAY IMAGEN → NO ROMPE
+    if not screenshot_base64:
+        return {
+            "status": "no_image",
+            "username": username,
+            "message": "No se pudo generar screenshot visual",
+            "scores": None,
+            "total_score": None,
+            "interpretation": None
+        }
 
     analysis = analyze_with_gpt(screenshot_base64)
 
@@ -162,6 +172,7 @@ def visual_analysis(data: VisualAnalysisRequest):
     total_score = sum(scores.values())
 
     return {
+        "status": "ok",
         "username": username,
         "scores": scores,
         "total_score": total_score,
