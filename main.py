@@ -11,9 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, constr
 from openai import OpenAI
 
-# Configuración de Logs para ver qué pasa en segundo plano
+# =====================
+# LOGGING
+# =====================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("konstrategy")
 
 # =====================
 # ENV
@@ -22,11 +24,17 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 APIFY_PROFILE_TASK_ID = os.getenv("APIFY_PROFILE_TASK_ID")
 APIFY_POSTS_TASK_ID = os.getenv("APIFY_POSTS_TASK_ID")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_URL = os.getenv("REDIS_URL")
+
+if not all([OPENAI_API_KEY, APIFY_TOKEN, APIFY_PROFILE_TASK_ID, APIFY_POSTS_TASK_ID, REDIS_URL]):
+    raise RuntimeError("Faltan variables de entorno requeridas")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-r = redis.from_url(REDIS_URL, decode_responses=True)
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
+# =====================
+# APP
+# =====================
 app = FastAPI()
 
 app.add_middleware(
@@ -44,27 +52,37 @@ class VisualAnalysisRequest(BaseModel):
     username: constr(min_length=1, max_length=200)
 
 # =====================
-# HELPERS
+# RATE LIMIT
 # =====================
 def rate_limit(request: Request):
     ip = request.client.host
     key = f"rate:{ip}"
-    count = r.get(key)
+
+    count = redis_client.get(key)
     if count and int(count) >= 5:
-        raise HTTPException(429, "Límite alcanzado (5 análisis por hora)")
-    pipe = r.pipeline()
+        raise HTTPException(status_code=429, detail="Límite alcanzado (5 análisis por hora)")
+
+    pipe = redis_client.pipeline()
     pipe.incr(key, 1)
     pipe.expire(key, 3600)
     pipe.execute()
 
-def start_apify_task(task_id, payload):
-    url = f"https://api.apify.com/v2/actor-tasks/{task_id}/runs?token={APIFY_TOKEN}"
-    res = requests.post(url, json=payload, timeout=30)
+# =====================
+# APIFY HELPERS
+# =====================
+def start_apify_task(task_id: str, payload: dict) -> str:
+    url = f"https://api.apify.com/v2/actor-tasks/{task_id}/runs"
+    res = requests.post(
+        url,
+        params={"token": APIFY_TOKEN},
+        json=payload,
+        timeout=30
+    )
     if res.status_code not in (200, 201):
-        raise Exception(f"Apify Start Error: {res.text}")
+        raise RuntimeError(f"Apify Start Error: {res.text}")
     return res.json()["data"]["id"]
 
-def wait_for_apify_run(run_id, timeout=300): # Aumentado a 5 min
+def wait_for_apify_run(run_id: str, timeout: int = 300) -> str:
     start = time.time()
     while time.time() - start < timeout:
         res = requests.get(
@@ -78,11 +96,13 @@ def wait_for_apify_run(run_id, timeout=300): # Aumentado a 5 min
         if status == "SUCCEEDED":
             return res.json()["data"]["defaultDatasetId"]
         if status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            raise Exception(f"Apify run failed: {status}")
-        time.sleep(5)
-    raise Exception("Apify timeout")
+            raise RuntimeError(f"Apify run failed: {status}")
 
-def get_apify_dataset(dataset_id):
+        time.sleep(5)
+
+    raise RuntimeError("Apify timeout")
+
+def get_apify_dataset(dataset_id: str) -> list:
     res = requests.get(
         f"https://api.apify.com/v2/datasets/{dataset_id}/items",
         params={"token": APIFY_TOKEN},
@@ -91,9 +111,9 @@ def get_apify_dataset(dataset_id):
     return res.json()
 
 # =====================
-# GPT ANALYSIS (FIXED)
+# GPT ANALYSIS (SDK NUEVO)
 # =====================
-def analyze_with_gpt(images, captions):
+def analyze_with_gpt(images: list, captions: list) -> dict:
     prompt = f"""
 Devuelve SOLO JSON válido:
 {{
@@ -111,62 +131,76 @@ Devuelve SOLO JSON válido:
 Contexto de captions:
 {json.dumps(captions[:10], ensure_ascii=False)}
 """
-    # Construcción correcta del mensaje para GPT-4o-mini con imágenes
-    content = [{"type": "text", "text": prompt}]
-    
-    # Solo enviamos las primeras 6 imágenes para evitar timeouts y costos excesivos
+
+    content = [{"type": "input_text", "text": prompt}]
+
     for img_url in images[:6]:
         content.append({
-            "type": "image_url",
-            "image_url": {"url": img_url}
+            "type": "input_image",
+            "image_url": img_url
         })
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini", # El modelo correcto
-        messages=[{"role": "user", "content": content}],
-        response_format={"type": "json_object"},
-        max_tokens=500
+    response = client.responses.create(
+        model="gpt-4o-mini",
+        input=[{
+            "role": "user",
+            "content": content
+        }],
+        max_output_tokens=500
     )
-    
-    return json.loads(response.choices[0].message.content)
+
+    return json.loads(response.output_text)
 
 # =====================
 # WORKER
 # =====================
-def run_analysis(job_id, username):
+def run_analysis(job_id: str, username: str):
     try:
-        logger.info(f"Iniciando análisis para: {username}")
+        logger.info(f"Iniciando análisis para {username}")
+
         raw = username.replace("@", "").strip()
         instagram_url = f"https://www.instagram.com/{raw}/"
 
-        # 1. PROFILE
-        logger.info("Obteniendo perfil...")
-        p_run = start_apify_task(APIFY_PROFILE_TASK_ID, {"instagramUrls": [instagram_url]})
-        p_dataset = wait_for_apify_run(p_run)
-        p_items = get_apify_dataset(p_dataset)
-        if not p_items: raise Exception("Perfil no encontrado en Instagram")
-        profile = p_items[0]
+        # PROFILE
+        profile_run = start_apify_task(
+            APIFY_PROFILE_TASK_ID,
+            {"instagramUrls": [instagram_url]}
+        )
+        profile_dataset = wait_for_apify_run(profile_run)
+        profile_items = get_apify_dataset(profile_dataset)
 
-        # 2. POSTS
-        logger.info("Obteniendo posts...")
-        posts_run = start_apify_task(APIFY_POSTS_TASK_ID, {"instagramUrls": [instagram_url], "resultsLimit": 15})
+        if not profile_items:
+            raise RuntimeError("Perfil no encontrado")
+
+        profile = profile_items[0]
+
+        # POSTS
+        posts_run = start_apify_task(
+            APIFY_POSTS_TASK_ID,
+            {
+                "instagramUrls": [instagram_url],
+                "resultsLimit": 15
+            }
+        )
         posts_dataset = wait_for_apify_run(posts_run)
         posts_data = get_apify_dataset(posts_dataset)
 
         images, captions = [], []
+
         for p in posts_data:
             img = p.get("displayUrl") or p.get("thumbnailUrl")
-            if img: images.append(img)
+            if img:
+                images.append(img)
             text = p.get("caption") or p.get("text")
-            if text: captions.append(text)
+            if text:
+                captions.append(text)
 
-        if not images: raise Exception("No se encontraron imágenes para analizar")
+        if not images:
+            raise RuntimeError("No se encontraron imágenes")
 
-        # 3. GPT
-        logger.info("Enviando a GPT-4o-mini...")
+        # GPT
         analysis = analyze_with_gpt(images, captions)
-        
-        # Calcular promedio
+
         total_score = round(sum(analysis["scores"].values()) / 5 * 10, 1)
 
         result = {
@@ -184,22 +218,27 @@ def run_analysis(job_id, username):
                 "interpretation": analysis["interpretation"]
             }
         }
-        r.setex(f"job:{job_id}", 3600, json.dumps(result))
+
+        redis_client.setex(f"job:{job_id}", 3600, json.dumps(result))
         logger.info(f"Análisis completado para {username}")
 
     except Exception as e:
-        logger.error(f"Error en worker: {str(e)}")
-        r.setex(f"job:{job_id}", 3600, json.dumps({"status": "error", "error": str(e)}))
+        logger.exception("Error en análisis")
+        redis_client.setex(
+            f"job:{job_id}",
+            3600,
+            json.dumps({"status": "error", "error": str(e)})
+        )
 
 # =====================
 # ROUTES
 # =====================
 @app.post("/analysis/start")
-def start(data: VisualAnalysisRequest, request: Request):
+def start_analysis(data: VisualAnalysisRequest, request: Request):
     rate_limit(request)
+
     job_id = str(uuid.uuid4())
-    
-    r.setex(f"job:{job_id}", 3600, json.dumps({"status": "processing"}))
+    redis_client.setex(f"job:{job_id}", 3600, json.dumps({"status": "processing"}))
 
     thread = threading.Thread(
         target=run_analysis,
@@ -211,8 +250,8 @@ def start(data: VisualAnalysisRequest, request: Request):
     return {"job_id": job_id}
 
 @app.get("/analysis/status/{job_id}")
-def status(job_id: str):
-    job = r.get(f"job:{job_id}")
+def analysis_status(job_id: str):
+    job = redis_client.get(f"job:{job_id}")
     if not job:
-        raise HTTPException(404, "Job expirado o no encontrado")
+        raise HTTPException(status_code=404, detail="Job expirado o no encontrado")
     return json.loads(job)
