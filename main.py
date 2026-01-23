@@ -3,10 +3,12 @@ import json
 import uuid
 import threading
 import requests
-from fastapi import FastAPI, HTTPException
+import redis
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, constr
 from openai import OpenAI
+from time import time
 
 # =====================
 # ENV
@@ -15,13 +17,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 APIFY_PROFILE_TASK_ID = os.getenv("APIFY_PROFILE_TASK_ID")
 APIFY_POSTS_TASK_ID = os.getenv("APIFY_POSTS_TASK_ID")
+REDIS_URL = os.getenv("REDIS_URL")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-# =====================
-# IN-MEMORY STORE (MVP)
-# =====================
-JOBS = {}
+r = redis.from_url(REDIS_URL, decode_responses=True)
 
 # =====================
 # APP
@@ -43,19 +42,29 @@ class VisualAnalysisRequest(BaseModel):
     username: constr(min_length=1, max_length=200)
 
 # =====================
+# RATE LIMIT (5 / hora por IP)
+# =====================
+def rate_limit(request: Request):
+    ip = request.client.host
+    key = f"rate:{ip}"
+    count = r.get(key)
+
+    if count and int(count) >= 5:
+        raise HTTPException(429, "Límite alcanzado (5 análisis / hora)")
+
+    pipe = r.pipeline()
+    pipe.incr(key, 1)
+    pipe.expire(key, 3600)
+    pipe.execute()
+
+# =====================
 # APIFY
 # =====================
-def run_task(task_id: str, payload: dict) -> list:
-    url = (
-        f"https://api.apify.com/v2/actor-tasks/"
-        f"{task_id}/run-sync-get-dataset-items"
-        f"?token={APIFY_TOKEN}"
-    )
-
+def run_task(task_id, payload):
+    url = f"https://api.apify.com/v2/actor-tasks/{task_id}/run-sync-get-dataset-items?token={APIFY_TOKEN}"
     res = requests.post(url, json=payload, timeout=180)
     if res.status_code != 200:
-        raise RuntimeError(res.text)
-
+        raise Exception(res.text)
     return res.json()
 
 # =====================
@@ -63,8 +72,6 @@ def run_task(task_id: str, payload: dict) -> list:
 # =====================
 def analyze_with_gpt(images, captions):
     prompt = f"""
-Analiza el LOOK & FEEL de un perfil de Instagram.
-
 Devuelve SOLO JSON válido:
 
 {{
@@ -79,7 +86,7 @@ Devuelve SOLO JSON válido:
   "interpretation": "Análisis visual profesional breve"
 }}
 
-Contexto textual:
+Contexto:
 {json.dumps(captions, ensure_ascii=False)}
 """
 
@@ -99,104 +106,72 @@ Contexto textual:
 # =====================
 # WORKER
 # =====================
-def run_analysis(job_id: str, username: str):
+def run_analysis(job_id, username):
     try:
-        raw = username.strip()
+        raw = username.replace("@", "")
+        instagram_url = f"https://www.instagram.com/{raw}/"
 
-        if raw.startswith("http"):
-            instagram_url = raw.rstrip("/")
-            username = raw.rstrip("/").split("/")[-1]
-        else:
-            username = raw.replace("@", "")
-            instagram_url = f"https://www.instagram.com/{username}/"
-
-        # PROFILE
-        profile_items = run_task(
+        profile = run_task(
             APIFY_PROFILE_TASK_ID,
             {"instagramUrls": [instagram_url]}
-        )
+        )[0]
 
-        if not profile_items:
-            raise Exception("Profile not found")
-
-        profile = profile_items[0]
-
-        profile_info = {
-            "username": username,
-            "icon": profile.get("profilePicUrl"),
-            "category": profile.get("businessCategoryName"),
-            "description": profile.get("biography"),
-            "followers": profile.get("followersCount"),
-            "following": profile.get("followsCount"),
-            "posts": profile.get("postsCount"),
-        }
-
-        # POSTS
-        posts_items = run_task(
+        posts = run_task(
             APIFY_POSTS_TASK_ID,
-            {
-                "instagramUrls": [instagram_url],
-                "resultsLimit": 20
-            }
+            {"instagramUrls": [instagram_url], "resultsLimit": 20}
         )
 
         images, captions = [], []
-
-        for item in posts_items:
-            img = item.get("displayUrl") or item.get("thumbnailUrl")
-            if img:
-                images.append(img)
-
-            text = item.get("caption") or item.get("text")
-            if text:
-                captions.append(text)
-
-        if len(images) < 1:
-            raise Exception("No usable images found")
+        for p in posts:
+            if p.get("displayUrl") or p.get("thumbnailUrl"):
+                images.append(p.get("displayUrl") or p.get("thumbnailUrl"))
+            if p.get("caption") or p.get("text"):
+                captions.append(p.get("caption") or p.get("text"))
 
         analysis = analyze_with_gpt(images, captions)
-        total_score = round(sum(analysis["scores"].values()) / 5 * 10, 1)
+        score = round(sum(analysis["scores"].values()) / 5 * 10, 1)
 
-        JOBS[job_id] = {
+        r.setex(f"job:{job_id}", 3600, json.dumps({
             "status": "done",
             "data": {
-                "profile": profile_info,
-                "scores": analysis["scores"],
-                "total_score": total_score,
-                "dominant_content_type": analysis["dominant_content_type"],
+                "profile": {
+                    "username": raw,
+                    "icon": profile.get("profilePicUrl"),
+                    "followers": profile.get("followersCount"),
+                    "posts": profile.get("postsCount")
+                },
+                "total_score": score,
                 "interpretation": analysis["interpretation"]
             }
-        }
+        }))
 
     except Exception as e:
-        JOBS[job_id] = {
+        r.setex(f"job:{job_id}", 3600, json.dumps({
             "status": "error",
             "error": str(e)
-        }
+        }))
 
 # =====================
 # ROUTES
 # =====================
-@app.get("/")
-def root():
-    return {"status": "ok"}
-
 @app.post("/analysis/start")
-def start_analysis(data: VisualAnalysisRequest):
-    job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"status": "processing"}
+def start(data: VisualAnalysisRequest, request: Request):
+    rate_limit(request)
 
-    thread = threading.Thread(
+    job_id = str(uuid.uuid4())
+    r.setex(f"job:{job_id}", 3600, json.dumps({"status": "processing"}))
+
+    threading.Thread(
         target=run_analysis,
         args=(job_id, data.username),
         daemon=True
-    )
-    thread.start()
+    ).start()
 
     return {"job_id": job_id}
 
 @app.get("/analysis/status/{job_id}")
-def get_status(job_id: str):
-    if job_id not in JOBS:
-        raise HTTPException(404, "Job not found")
-    return JOBS[job_id]
+def status(job_id: str):
+    job = r.get(f"job:{job_id}")
+    if not job:
+        raise HTTPException(404, "Job expirado")
+    return json.loads(job)
